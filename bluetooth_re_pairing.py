@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -340,6 +341,7 @@ class WindowsBackend:
     )
 
     open_settings_on_failure = True   # service mode turns this off
+    WATCHER_SETTLE_TIMEOUT_S = 3
 
     def __init__(self):
         try:
@@ -405,6 +407,85 @@ class WindowsBackend:
         self._enum_time = time.time()
         return infos
 
+    def _create_watcher(self):
+        di = self.en.DeviceInformation
+        props = ["System.Devices.Aep.IsPresent", "System.Devices.Aep.IsConnected"]
+        kind = self.en.DeviceInformationKind.ASSOCIATION_ENDPOINT
+        create = getattr(di, "create_watcher", None)
+        if create is not None:
+            try:
+                return create(self.AQS, props, kind)
+            except TypeError:
+                pass
+        create = getattr(
+            di, "create_watcher_with_kind_aqs_filter_and_additional_properties",
+            None)
+        return create(self.AQS, props, kind) if create is not None else None
+
+    def _watch(self, timeout, mac=None, paired_only=False):
+        """Collect Bluetooth endpoints from DeviceWatcher events, not FindAllAsync."""
+        watcher = self._create_watcher()
+        if watcher is None:
+            return None
+
+        devices = {}
+        lock = threading.Lock()
+        matched = threading.Event()
+
+        def matches(info):
+            if mac is None or not self._same_device(info, mac):
+                return False
+            if paired_only and not info.pairing.is_paired:
+                return False
+            return paired_only or self._is_present(info) is not False
+
+        def on_added(_sender, info):
+            with lock:
+                devices[info.id] = info
+                self.infos[info.id] = info
+            if matches(info):
+                matched.set()
+
+        def on_updated(_sender, update):
+            with lock:
+                info = devices.get(update.id) or self.infos.get(update.id)
+                if info is not None:
+                    info.update(update)
+                    devices[update.id] = info
+            if info is not None and matches(info):
+                matched.set()
+
+        def on_removed(_sender, update):
+            with lock:
+                devices.pop(update.id, None)
+                self.infos.pop(update.id, None)
+
+        tokens = (
+            ("added", watcher.add_added(on_added)),
+            ("updated", watcher.add_updated(on_updated)),
+            ("removed", watcher.add_removed(on_removed)),
+        )
+        started = False
+        try:
+            watcher.start()
+            started = True
+            if mac is None:
+                time.sleep(timeout)
+            else:
+                matched.wait(timeout)
+        finally:
+            try:
+                if started:
+                    watcher.stop()
+            finally:
+                for event, token in tokens:
+                    getattr(watcher, f"remove_{event}")(token)
+
+        with lock:
+            result = list(devices.values())
+        self._enum_time = time.time()
+        return result
+
     def _is_present(self, info):
         """True if Windows currently sees the device in range (None if unknown)."""
         try:
@@ -425,24 +506,44 @@ class WindowsBackend:
         pass  # Windows manages the adapter itself; make sure Bluetooth is ON.
 
     def list_devices(self, timeout):
-        deadline = time.time() + timeout
+        infos = self._watch(timeout)
+        if infos is None:
+            deadline = time.time() + timeout
+            seen = {}
+            while True:
+                for i in self._enumerate():
+                    mac = mac_from_id(i.id)
+                    if not mac or not i.name:
+                        continue
+                    paired = bool(i.pairing.is_paired)
+                    if self._is_present(i) is False and not paired:
+                        continue
+                    seen[norm_mac(mac)] = {
+                        "mac": mac, "name": i.name, "paired": paired}
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(1.0, remaining))
+            return list(seen.values())
+
         seen = {}
-        while True:
-            for i in self._enumerate():
-                mac = mac_from_id(i.id)
-                if not mac or not i.name:
-                    continue
-                paired = bool(i.pairing.is_paired)
-                if self._is_present(i) is False and not paired:
-                    continue   # stale cache entry of a device that is not around
-                seen[norm_mac(mac)] = {"mac": mac, "name": i.name, "paired": paired}
-            if time.time() >= deadline:
-                break
+        for i in infos:
+            mac = mac_from_id(i.id)
+            if not mac or not i.name:
+                continue
+            paired = bool(i.pairing.is_paired)
+            if self._is_present(i) is False and not paired:
+                continue
+            seen[norm_mac(mac)] = {
+                "mac": mac, "name": i.name, "paired": paired}
         return list(seen.values())
 
     def is_connected(self, mac):
         """True / False, or None when Windows does not report the state."""
-        for i in self._enumerate():
+        infos = self._watch(self.WATCHER_SETTLE_TIMEOUT_S, mac, paired_only=True)
+        if infos is None:
+            infos = self._enumerate()
+        for i in infos:
             if i.pairing.is_paired and self._same_device(i, mac):
                 try:
                     return bool(i.properties["System.Devices.Aep.IsConnected"])
@@ -451,7 +552,14 @@ class WindowsBackend:
         return False
 
     def find_known(self, mac):
-        return [(i.id, i.name) for i in self._enumerate(max_age=60)
+        if self.infos and time.time() - self._enum_time < 60:
+            infos = list(self.infos.values())
+        else:
+            infos = self._watch(
+                self.WATCHER_SETTLE_TIMEOUT_S, mac, paired_only=True)
+            if infos is None:
+                infos = self._enumerate()
+        return [(i.id, i.name) for i in infos
                 if i.pairing.is_paired and self._same_device(i, mac)]
 
     def remove(self, ids):
@@ -465,17 +573,31 @@ class WindowsBackend:
                   + ("" if res.status in ok else "  (failed)"))
 
     def discover(self, mac, timeout):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            for i in self._enumerate():
-                if not self._same_device(i, mac):
-                    continue
-                # Ignore stale cache entries: the device must really be in range
-                if self._is_present(i) is False:
-                    continue
+        infos = self._watch(timeout, mac)
+        if infos is None:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                for i in self._enumerate():
+                    if not self._same_device(i, mac):
+                        continue
+                    if self._is_present(i) is False:
+                        continue
+                    return i.id, i.name
+                time.sleep(min(1.0, max(0, deadline - time.time())))
+            return None
+        for i in infos:
+            if self._same_device(i, mac) and self._is_present(i) is not False:
                 return i.id, i.name
-            time.sleep(0.5)
         return None
+
+    def _refresh_device(self, dev_id):
+        mac = mac_from_id(dev_id)
+        if not mac:
+            return self.infos.get(dev_id)
+        infos = self._watch(self.WATCHER_SETTLE_TIMEOUT_S, mac)
+        if infos is None:
+            infos = self._enumerate()
+        return next((i for i in infos if self._same_device(i, mac)), None)
 
     def _pair_custom(self, info):
         """Pair using our own ceremony handler (accepts confirm / PIN prompts)."""
@@ -513,22 +635,23 @@ class WindowsBackend:
             if attempt > 1:
                 print(f"    Retry {attempt}/{attempts} (keep the device in pairing mode) ...")
                 time.sleep(3)
-            if attempt > 1 or dev_id not in self.infos:
-                self._enumerate()
-            info = self.infos.get(dev_id)
+            info = (self._refresh_device(dev_id)
+                    if attempt > 1 or dev_id not in self.infos
+                    else self.infos[dev_id])
             if info is None:
                 print("    Device not visible anymore; is it still in pairing mode?")
                 continue
+            dev_id = info.id
             # A leftover pairing record makes new pairing fail: remove it first
             if info.pairing.is_paired:
                 print("    Stale pairing record found; unpairing it first ...")
                 asyncio.run(self._await(info.pairing.unpair_async()))
                 time.sleep(2)
-                self._enumerate()
-                info = self.infos.get(dev_id)
+                info = self._refresh_device(dev_id)
                 if info is None:
                     print("    Device not visible after unpair; keep pairing mode on.")
                     continue
+                dev_id = info.id
             if attempt == 1:
                 # Custom pairing is the most reliable way to pair classic devices
                 print("    Using custom pairing (auto-accepting any confirmation/PIN) ...")
@@ -579,6 +702,7 @@ def repair_device(be, mac, name):
         t = now
 
     known = be.find_known(mac)
+    lap("lookup")
     if known:
         be.remove([dev_id for dev_id, _ in known])
     else:
